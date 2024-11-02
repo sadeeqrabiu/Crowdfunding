@@ -1,0 +1,150 @@
+#include "imports/stdlib.fc";
+
+
+;; Storage variables structure
+;; owner_address: MsgAddress
+;; goal_amount: Integer
+;; deadline: Integer (unix timestamp)
+;; total_raised: Integer
+;; contributors: HashmapE(MsgAddress, Integer)
+;; is_active: Integer (0 or 1)
+
+(int, slice, int, int, int, cell, int) load_data() inline {
+    var ds = get_data().begin_parse();
+    return (
+        ds~load_uint(1),     ;; init
+        ds~load_msg_addr(),  ;; owner_address
+        ds~load_coins(),     ;; goal_amount
+        ds~load_uint(64),    ;; deadline
+        ds~load_coins(),     ;; total_raised
+        ds~load_dict(),      ;; contributors
+        ds~load_uint(1)      ;; is_active
+    );
+}
+
+() save_data(int init, slice owner_address, int goal_amount, int deadline, 
+            int total_raised, cell contributors, int is_active) impure inline {
+    set_data(begin_cell()
+        .store_uint(init, 1)
+        .store_slice(owner_address)
+        .store_coins(goal_amount)
+        .store_uint(deadline, 64)
+        .store_coins(total_raised)
+        .store_dict(contributors)
+        .store_uint(is_active, 1)
+        .end_cell());
+}
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+
+ if (in_msg_body.slice_empty?()) { ;; Receive TON contribution
+        return ();
+    }
+
+    slice cs = in_msg_full.begin_parse();
+
+    int flags = cs~load_uint(4);
+    if (flags & 1) { ;; Ignore bounced messages
+        return ();
+    }
+
+    slice sender_address = cs~load_msg_addr();
+
+    (int init, slice owner_address, int goal_amount, int deadline,
+     int total_raised, cell contributors, int is_active) = load_data();
+
+    int op = in_msg_body~load_uint(32);
+    int query_id = in_msg_body~load_uint(64);
+
+     ;; Initialize contract
+    if (op == 1) { ;; op 1 = initialize
+        throw_if(85, init); ;; Already initialized
+        int new_goal_amount = in_msg_body~load_coins();
+        int new_deadline = in_msg_body~load_uint(64);
+        
+        save_data(true, sender_address, new_goal_amount, new_deadline, 
+                 0, new_dict(), 1);
+        return ();
+    }
+
+     ;; Contribute funds
+    if (op == 2) { ;; op 2 = contribute
+        throw_unless(86, is_active);
+        throw_if(87, now() >= deadline);
+        
+        int contribution = msg_value;
+        contributors~udict_set_builder(267, 
+            sender_address.slice_hash(), 
+            begin_cell().store_coins(contribution).store_slice(sender_address));
+        
+        total_raised += contribution;
+        
+        save_data(init, owner_address, goal_amount, deadline,
+                 total_raised, contributors, is_active);
+        return ();
+    }
+     ;; Finish campaign
+    if (op == 3) { ;; op 3 = finish
+        throw_unless(88, equal_slices(sender_address, owner_address));
+        throw_unless(89, now() >= deadline);
+        throw_unless(90, is_active);
+
+        if (total_raised >= goal_amount) {
+            ;; Campaign successful - send funds to owner
+            var msg = begin_cell()
+                .store_uint(0x18, 6)
+                .store_slice(owner_address)
+                .store_coins(total_raised)
+                .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+                .end_cell();
+            send_raw_message(msg, 1);
+        }
+        
+        save_data(init, owner_address, goal_amount, deadline,
+                 total_raised, contributors, 0);
+        return ();
+    }
+
+     ;; Claim refund
+    if (op == 4) { ;; op 4 = claim_refund
+        throw_unless(91, now() >= deadline);
+        throw_unless(92, total_raised < goal_amount);
+        throw_unless(93, is_active);
+        
+        (slice cs, int found) = contributors.udict_get?(267, sender_address.slice_hash()); 
+        throw_unless(94, found);
+        
+        int contribution = cs~load_coins();
+        contributors~udict_delete?(267, sender_address.slice_hash());
+        
+        var msg = begin_cell()
+            .store_uint(0x18, 6)
+            .store_slice(sender_address)
+            .store_coins(contribution)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .end_cell();
+        send_raw_message(msg, 1);
+        
+        save_data(init, owner_address, goal_amount, deadline,
+                 total_raised - contribution, contributors, 0);
+        return ();
+    }
+
+    throw(95); ;; Unknown operation
+}
+
+;; Get methods
+(int, int, int) get_campaign_info() method_id {
+    (int init, slice owner_address, int goal_amount, int deadline,
+     int total_raised, cell contributors, int is_active) = load_data();
+    return (goal_amount, deadline, total_raised);
+}
+
+int get_contribution(slice address) method_id {
+    (_, _, _, _, _, cell contributors, _) = load_data();
+    (slice cs, int found) = contributors.udict_get?(267, address.slice_hash());
+    if (found) {
+        return cs~load_coins();
+    }
+    return 0;
+}
